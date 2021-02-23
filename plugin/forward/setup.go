@@ -19,35 +19,39 @@ import (
 func init() { plugin.Register("forward", setup) }
 
 func setup(c *caddy.Controller) error {
-	f, err := parseForward(c)
-	if err != nil {
-		return plugin.Error("forward", err)
-	}
-	if f.Len() > max {
-		return plugin.Error("forward", fmt.Errorf("more than %d TOs configured: %d", max, f.Len()))
-	}
-
-	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		f.Next = next
-		return f
-	})
-
-	c.OnStartup(func() error {
-		return f.OnStartup()
-	})
-	c.OnStartup(func() error {
-		if taph := dnsserver.GetConfig(c).Handler("dnstap"); taph != nil {
-			if tapPlugin, ok := taph.(dnstap.Dnstap); ok {
-				f.tapPlugin = &tapPlugin
-			}
+	for {
+		f, err := parseForward(c)
+		if err != nil {
+			return plugin.Error("forward", err)
 		}
-		return nil
-	})
+		if f == nil {
+			break
+		}
+		if f.Len() > max {
+			return plugin.Error("forward", fmt.Errorf("more than %d TOs configured: %d", max, f.Len()))
+		}
 
-	c.OnShutdown(func() error {
-		return f.OnShutdown()
-	})
+		dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
+			f.Next = next
+			return f
+		})
 
+		c.OnStartup(func() error {
+			return f.OnStartup()
+		})
+		c.OnStartup(func() error {
+			if taph := dnsserver.GetConfig(c).Handler("dnstap"); taph != nil {
+				if tapPlugin, ok := taph.(dnstap.Dnstap); ok {
+					f.tapPlugin = &tapPlugin
+				}
+			}
+			return nil
+		})
+
+		c.OnShutdown(func() error {
+			return f.OnShutdown()
+		})
+	}
 	return nil
 }
 
@@ -71,19 +75,15 @@ func parseForward(c *caddy.Controller) (*Forward, error) {
 	var (
 		f   *Forward
 		err error
-		i   int
 	)
 	for c.Next() {
-		if i > 0 {
-			return nil, plugin.ErrOnce
-		}
-		i++
 		f, err = parseStanza(c)
 		if err != nil {
 			return nil, err
 		}
+		return f, nil
 	}
-	return f, nil
+	return nil, nil
 }
 
 func parseStanza(c *caddy.Controller) (*Forward, error) {
