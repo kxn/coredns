@@ -1,10 +1,14 @@
 package forward
 
 import (
+	"bufio"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coredns/caddy"
@@ -92,29 +96,49 @@ func parseStanza(c *caddy.Controller) (*Forward, error) {
 	if !c.Args(&f.from) {
 		return f, c.ArgErr()
 	}
-	f.from = plugin.Host(f.from).Normalize()
 
-	to := c.RemainingArgs()
-	if len(to) == 0 {
-		return f, c.ArgErr()
-	}
-
-	toHosts, err := parse.HostPortOrFile(to...)
-	if err != nil {
-		return f, err
-	}
-
-	transports := make([]string, len(toHosts))
-	allowedTrans := map[string]bool{"dns": true, "tls": true}
-	for i, host := range toHosts {
-		trans, h := parse.Transport(host)
-
-		if !allowedTrans[trans] {
-			return f, fmt.Errorf("'%s' is not supported as a destination protocol in forward: %s", trans, host)
+	var (
+		transports []string
+	)
+	if f.from != "FILE" {
+		f.isFileForward = false
+		f.from = plugin.Host(f.from).Normalize()
+		to := c.RemainingArgs()
+		if len(to) == 0 {
+			return f, c.ArgErr()
 		}
-		p := NewProxy(h, trans)
-		f.proxies = append(f.proxies, p)
-		transports[i] = trans
+
+		toHosts, err := parse.HostPortOrFile(to...)
+		if err != nil {
+			return f, err
+		}
+
+		transports = make([]string, len(toHosts))
+		allowedTrans := map[string]bool{"dns": true, "tls": true}
+		for i, host := range toHosts {
+			trans, h := parse.Transport(host)
+
+			if !allowedTrans[trans] {
+				return f, fmt.Errorf("'%s' is not supported as a destination protocol in forward: %s", trans, host)
+			}
+			p := NewProxy(h, trans)
+			f.proxies = append(f.proxies, p)
+			transports[i] = trans
+		}
+	} else {
+		// Is a "FILE" syntax, read and parse the file into map
+		f.isFileForward = true
+		to := c.RemainingArgs()
+		if len(to) != 1 {
+			return f, c.ArgErr()
+		}
+		err := readForwardFromFile(to[0], f)
+		if err != nil {
+			return f, err
+		}
+		transports = make([]string, len(f.proxies))
+		// We probably should fill it with "dns", but ..
+
 	}
 
 	for c.NextBlock() {
@@ -141,6 +165,62 @@ func parseStanza(c *caddy.Controller) (*Forward, error) {
 	}
 
 	return f, nil
+}
+
+func readForwardFromFile(filename string, f *Forward) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+	var (
+		currentProxyList *[]*Proxy
+	)
+	namedProxies := make(map[string]*Proxy)
+	nameRe := regexp.MustCompile(`name:\s*([^\s]+)`)
+	forwardAddrRe := regexp.MustCompile(`forward-addr:\s*([\d\.]+)`)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.ToLower(scanner.Text())
+		if strings.Contains(line, "name:") {
+			m := nameRe.FindAllStringSubmatch(line, 1)
+			if m != nil && len(m) == 1 && len(m[0]) == 2 {
+				name := plugin.Host(m[0][1]).Normalize()
+				_, ok := f.domainProxies[name]
+				if !ok {
+					f.domainProxies[name] = &[]*Proxy{}
+				}
+				currentProxyList = f.domainProxies[name]
+				continue
+			}
+			return fmt.Errorf("Invalid line of name '%s'", line)
+		}
+		if strings.Contains(line, "forward-addr:") {
+			m := forwardAddrRe.FindAllStringSubmatch(line, 1)
+			if m != nil && len(m) == 1 && len(m[0]) == 2 {
+				forwardAddr := m[0][1]
+				p, ok := namedProxies[forwardAddr]
+				if !ok {
+					p = NewProxy(forwardAddr+":53", "dns")
+					namedProxies[forwardAddr] = p
+					f.proxies = append(f.proxies, p)
+				}
+				if currentProxyList == nil {
+					return fmt.Errorf("Invalid file, forward-addr without name first")
+				}
+				*currentProxyList = append(*currentProxyList, p)
+				continue
+			}
+			return fmt.Errorf("Invalid line of name '%s'", line)
+		}
+
+	}
+	if scanner.Err() != nil {
+		return scanner.Err()
+	}
+	// Everything should be setup right now
+	return nil
 }
 
 func parseBlock(c *caddy.Controller, f *Forward) error {
@@ -261,4 +341,4 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 	return nil
 }
 
-const max = 15 // Maximum number of upstreams.
+const max = 256 // Maximum number of upstreams.

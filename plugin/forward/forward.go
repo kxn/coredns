@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -28,9 +29,11 @@ var log = clog.NewWithPlugin("forward")
 type Forward struct {
 	concurrent int64 // atomic counters need to be first in struct for proper alignment
 
-	proxies    []*Proxy
-	p          Policy
-	hcInterval time.Duration
+	proxies       []*Proxy             // actual proxy objects holder
+	domainProxies map[string]*[]*Proxy // actual domain map lookup,  "google.com" -> [ NewProxy("10.12.1.1"), NewProxy("10.12.1.2") ]
+	isFileForward bool                 // Whether it is a file type forward
+	p             Policy
+	hcInterval    time.Duration
 
 	from    string
 	ignored []string
@@ -54,7 +57,7 @@ type Forward struct {
 
 // New returns a new Forward.
 func New() *Forward {
-	f := &Forward{maxfails: 2, tlsConfig: new(tls.Config), expire: defaultExpire, p: new(random), from: ".", hcInterval: hcInterval, opts: options{forceTCP: false, preferUDP: false, hcRecursionDesired: true}}
+	f := &Forward{maxfails: 2, domainProxies: make(map[string]*[]*Proxy), tlsConfig: new(tls.Config), expire: defaultExpire, p: new(random), from: ".", hcInterval: hcInterval, opts: options{forceTCP: false, preferUDP: false, hcRecursionDesired: true}}
 	return f
 }
 
@@ -74,7 +77,14 @@ func (f *Forward) Name() string { return "forward" }
 func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 
 	state := request.Request{W: w, Req: r}
-	if !f.match(state) {
+
+	if !f.isFileForward && !f.match(state) {
+		return plugin.NextOrFailure(f.Name(), f.Next, ctx, w, r)
+	}
+
+	// Check whether it can serve the request
+	list := f.List(&state)
+	if list == nil {
 		return plugin.NextOrFailure(f.Name(), f.Next, ctx, w, r)
 	}
 
@@ -92,7 +102,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 	var upstreamErr error
 	span = ot.SpanFromContext(ctx)
 	i := 0
-	list := f.List()
+
 	deadline := time.Now().Add(defaultTimeout)
 	start := time.Now()
 	for time.Now().Before(deadline) {
@@ -106,13 +116,13 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		i++
 		if proxy.Down(f.maxfails) {
 			fails++
-			if fails < len(f.proxies) {
+			if fails < len(list) {
 				continue
 			}
 			// All upstream proxies are dead, assume healthcheck is completely broken and randomly
 			// select an upstream to connect to.
 			r := new(random)
-			proxy = r.List(f.proxies)[0]
+			proxy = r.List(list)[0]
 
 			HealthcheckBrokenCount.Add(1)
 		}
@@ -156,7 +166,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 				proxy.Healthcheck()
 			}
 
-			if fails < len(f.proxies) {
+			if fails < len(list) {
 				continue
 			}
 			break
@@ -211,7 +221,37 @@ func (f *Forward) ForceTCP() bool { return f.opts.forceTCP }
 func (f *Forward) PreferUDP() bool { return f.opts.preferUDP }
 
 // List returns a set of proxies to be used for this client depending on the policy in f.
-func (f *Forward) List() []*Proxy { return f.p.List(f.proxies) }
+func (f *Forward) List(state *request.Request) []*Proxy {
+	var ret []*Proxy
+	if f.isFileForward {
+		ret = f.getListByState(state)
+	} else {
+		ret = f.proxies
+	}
+	if ret == nil {
+		return nil
+	}
+	return f.p.List(ret)
+}
+
+func (f *Forward) getListByState(state *request.Request) []*Proxy {
+	// Copied from server.go, max suffix matching
+	q := strings.ToLower(state.Req.Question[0].Name)
+	var (
+		off int
+		end bool
+	)
+	for {
+		if ret, ok := f.domainProxies[q[off:]]; ok {
+			return *ret
+		}
+		off, end = dns.NextLabel(q, off)
+		if end {
+			break
+		}
+	}
+	return nil
+}
 
 var (
 	// ErrNoHealthy means no healthy proxies left.
