@@ -214,7 +214,10 @@ func readForwardFromFile(filename string, f *Forward) error {
 			}
 			return fmt.Errorf("Invalid line of name '%s'", line)
 		}
-
+		s := strings.Trim(line, " \t\r\n")
+		if s != "" && s != "forward-zone:" {
+			return fmt.Errorf("Unrecognized line '%s'", line)
+		}
 	}
 	if scanner.Err() != nil {
 		return scanner.Err()
