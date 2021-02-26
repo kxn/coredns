@@ -1,3 +1,29 @@
+This is a forked version of CoreDNS, which includes 3 changes
+
+* Enable multiple forward directives in the same block. The directives are evaluated from top to bottom at run time.
+* Slightly modified forward syntax which allows importing a snippet of "forward only" unbound config file
+* Added a ubfile plugin which can emulate almost the same behaviour of unbound local zone/data, taking unbound config snippet as input
+
+Basically it is used to replace the unbound software in a company's corporate network, so keeping unbound compatibility is first priority.
+
+Example configuration
+
+~~~ txt
+. {
+   ubfile /etc/unbound/local.d/dns.conf
+   forward FILE /etc/unbound/conf.d/dns.conf
+   forward . 8.8.8.8 4.4.4.4
+   cache 600 {
+      prefetch 5
+      serve_stale
+   }
+   prometheus
+   loadbalance
+   errors
+}
+~~~
+
+
 [![CoreDNS](https://coredns.io/images/CoreDNS_Colour_Horizontal.png)](https://coredns.io)
 
 [![Documentation](https://img.shields.io/badge/godoc-reference-blue.svg)](https://godoc.org/github.com/coredns/coredns)
