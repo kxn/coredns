@@ -90,21 +90,40 @@ func (u UBFile) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 				// break and next
 				break
 			case zoneRedirect:
-				// only lookup for A type questions, otherwise make it NXDOMAIN
-				if state.QType() != dns.TypeA {
+				// only lookup for A/PTR/MX type questions, otherwise make it NXDOMAIN
+				switch state.QType() {
+				case dns.TypeA, dns.TypePTR, dns.TypeMX:
+				default:
 					u.returnNXDomain(r, w, zone.fqdn)
 					return dns.RcodeSuccess, nil
 				}
-				if zone.ips == nil {
+				// back lookup zone name in hosts
+				recs, ok := u.uBData.Records[zone.fqdn]
+				if !ok {
 					u.returnNXDomain(r, w, zone.fqdn)
 					return dns.RcodeSuccess, nil
 				}
-				// we can not simply return the list -- we need patch the names
-				newlist := make([]dns.RR, len(*zone.ips))
+				rlist, ok := recs.rr[state.QType()]
+				if !ok {
+					u.returnNXDomain(r, w, zone.fqdn)
+					return dns.RcodeSuccess, nil
+				}
+				// make a copy of the rr records
+				newlist := make([]dns.RR, len(rlist))
 				for i := 0; i < len(newlist); i++ {
-					r := (*zone.ips)[i]
-					r.Hdr = dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: r.Header().Ttl}
-					newlist[i] = &r
+					var r dns.RR
+					switch state.QType() {
+					case dns.TypeA:
+						r = copyA(qname, rlist[i])
+					case dns.TypeMX:
+						r = copyMX(qname, rlist[i])
+					case dns.TypePTR:
+						r = copyPTR(qname, rlist[i])
+					}
+					if r == nil {
+						return dns.RcodeServerFailure, nil
+					}
+					newlist[i] = r
 				}
 				u.returnOK(r, w, newlist)
 				return dns.RcodeSuccess, nil

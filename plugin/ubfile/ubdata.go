@@ -29,7 +29,6 @@ const (
 type dnsZone struct {
 	fqdn     string
 	zonetype zoneType
-	ips      *[]dns.A // mainly a hack to store original data for redirect zone lookup
 }
 
 // UBDataFile  hold everything the unbound file knows
@@ -55,19 +54,13 @@ func newUBDataFile() UBDataFile {
 	return ret
 }
 
-func (u *UBDataFile) parseAndAddRecord(line string, temp map[string][]dns.A) error {
+func (u *UBDataFile) parseAndAddRecord(line string) error {
 	m := u.aRe.FindAllStringSubmatch(line, 1)
 	if m != nil {
 		name := plugin.Host(m[0][1]).Normalize()
 		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		r := makeA(name, m[0][3], ttl)
 		u.getRecord(name).addRR(r)
-		// Hack to keep a record
-		_, ok := temp[name]
-		if !ok {
-			temp[name] = []dns.A{}
-		}
-		temp[name] = append(temp[name], *r)
 		return nil
 	}
 
@@ -132,8 +125,6 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 	}
 	defer file.Close()
 
-	temp := map[string][]dns.A{}
-
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.ToLower(scanner.Text())
@@ -163,7 +154,7 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 		if strings.Contains(line, "local-data:") {
 			m := u.dataRe.FindAllStringSubmatch(line, 1)
 			if m != nil && len(m) == 1 && len(m[0]) == 2 {
-				err := u.parseAndAddRecord(m[0][1], temp)
+				err := u.parseAndAddRecord(m[0][1])
 				if err != nil {
 					return u, err
 				}
@@ -177,20 +168,6 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 	}
 	if scanner.Err() != nil {
 		return u, scanner.Err()
-	}
-	// Everything should be setup right now
-	// hack, fill all redirect zones with dns.A arrays
-	redirectedkeys := []string{}
-	for k, v := range u.Zones {
-		if v.zonetype == zoneRedirect {
-			redirectedkeys = append(redirectedkeys, k)
-		}
-	}
-	for _, k := range redirectedkeys {
-		r, ok := temp[k]
-		if ok {
-			u.Zones[k].ips = &r
-		}
 	}
 	return u, nil
 }
@@ -221,6 +198,17 @@ func makeA(name, ip string, ttl uint64) *dns.A {
 	return r
 }
 
+func copyA(newname string, r dns.RR) *dns.A {
+	source, ok := r.(*dns.A)
+	if !ok {
+		return nil
+	}
+	ret := new(dns.A)
+	ret.Hdr = dns.RR_Header{Name: newname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: source.Header().Ttl}
+	ret.A = source.A
+	return ret
+}
+
 func makeMX(name, mx string, ttl, pref uint64) *dns.MX {
 	r := new(dns.MX)
 	r.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeMX, Class: dns.ClassINET, Ttl: uint32(ttl)}
@@ -229,11 +217,34 @@ func makeMX(name, mx string, ttl, pref uint64) *dns.MX {
 	return r
 }
 
+func copyMX(newname string, r dns.RR) *dns.MX {
+	source, ok := r.(*dns.MX)
+	if !ok {
+		return nil
+	}
+	ret := new(dns.MX)
+	ret.Hdr = dns.RR_Header{Name: newname, Rrtype: dns.TypeMX, Class: dns.ClassINET, Ttl: source.Header().Ttl}
+	ret.Mx = source.Mx
+	ret.Preference = source.Preference
+	return ret
+}
+
 func makePTR(name, ptr string, ttl uint64) *dns.PTR {
 	r := new(dns.PTR)
 	r.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: uint32(ttl)}
 	r.Ptr = ptr
 	return r
+}
+
+func copyPTR(newname string, r dns.RR) *dns.PTR {
+	source, ok := r.(*dns.PTR)
+	if !ok {
+		return nil
+	}
+	ret := new(dns.PTR)
+	ret.Hdr = dns.RR_Header{Name: newname, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: source.Header().Ttl}
+	ret.Ptr = source.Ptr
+	return ret
 }
 
 func makeSRV(name, target string, ttl, prio, weight, port uint64) *dns.SRV {
