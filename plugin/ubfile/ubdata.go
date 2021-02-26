@@ -37,15 +37,12 @@ type UBDataFile struct {
 	Records                                        map[string]*dnsRecord
 	Zones                                          map[string]*dnsZone
 	zoneRe, dataRe, soaRe, mxRe, aRe, ptrRe, srvRe *regexp.Regexp
-	// very ugly name to remind myself to remove it ...
-	temp map[string]*[]dns.A
 }
 
 func newUBDataFile() UBDataFile {
 	ret := UBDataFile{
 		Records: map[string]*dnsRecord{},
 		Zones:   map[string]*dnsZone{},
-		temp:    map[string]*[]dns.A{},
 	}
 	ret.zoneRe = regexp.MustCompile(`local-zone:\s*\"*([^\s^\"]+)\"*\s+([\w]+)`)
 	ret.dataRe = regexp.MustCompile(`local-data:\s*\"([^\"]+)\"`)
@@ -58,55 +55,59 @@ func newUBDataFile() UBDataFile {
 	return ret
 }
 
-func (u *UBDataFile) parseAndAddRecord(line string) error {
+func (u *UBDataFile) parseAndAddRecord(line string, temp map[string][]dns.A) error {
 	m := u.aRe.FindAllStringSubmatch(line, 1)
 	if m != nil {
-		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		name := plugin.Host(m[0][1]).Normalize()
-		u.getRecord(name).addA(m[0][3], ttl)
+		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
+		r := makeA(name, m[0][3], ttl)
+		u.getRecord(name).addRR(r)
 		// Hack to keep a record
-		_, ok := u.temp[name]
+		_, ok := temp[name]
 		if !ok {
-			u.temp[name] = &[]dns.A{}
+			temp[name] = []dns.A{}
 		}
-		r := dns.A{
-			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(ttl)},
-			A:   net.ParseIP(m[0][3]),
-		}
-		*u.temp[name] = append(*u.temp[name], r)
+		temp[name] = append(temp[name], *r)
 		return nil
 	}
 
 	m = u.mxRe.FindAllStringSubmatch(line, 1)
 	if m != nil {
+		name := plugin.Host(m[0][1]).Normalize()
 		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		pref, _ := strconv.ParseUint(m[0][3], 10, 16)
 		mx := plugin.Host(m[0][4]).Normalize()
-		u.getRecord(plugin.Host(m[0][1]).Normalize()).addMX(mx, ttl, pref)
+		r := makeMX(name, mx, ttl, pref)
+		u.getRecord(name).addRR(r)
 		return nil
 	}
 
 	m = u.srvRe.FindAllStringSubmatch(line, 1)
 	if m != nil {
+		name := plugin.Host(m[0][1]).Normalize()
 		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		pref, _ := strconv.ParseUint(m[0][3], 10, 16)
 		weight, _ := strconv.ParseUint(m[0][4], 10, 16)
 		port, _ := strconv.ParseUint(m[0][5], 10, 16)
 		target := plugin.Host(m[0][6]).Normalize()
-		u.getRecord(plugin.Host(m[0][1]).Normalize()).addSRV(target, ttl, pref, weight, port)
+		r := makeSRV(name, target, ttl, pref, weight, port)
+		u.getRecord(name).addRR(r)
 		return nil
 	}
 
 	m = u.ptrRe.FindAllStringSubmatch(line, 1)
 	if m != nil {
+		name := plugin.Host(m[0][1]).Normalize()
 		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		ptr := plugin.Host(m[0][3]).Normalize()
-		u.getRecord(plugin.Host(m[0][1]).Normalize()).addPTR(ptr, ttl)
+		r := makePTR(name, ptr, ttl)
+		u.getRecord(name).addRR(r)
 		return nil
 	}
 
 	m = u.soaRe.FindAllStringSubmatch(line, 1)
 	if m != nil {
+		name := plugin.Host(m[0][1]).Normalize()
 		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		serial, _ := strconv.ParseUint(m[0][5], 10, 32)
 		refresh, _ := strconv.ParseUint(m[0][6], 10, 32)
@@ -115,7 +116,8 @@ func (u *UBDataFile) parseAndAddRecord(line string) error {
 		minttl, _ := strconv.ParseUint(m[0][9], 10, 32)
 		ns := plugin.Host(m[0][3]).Normalize()
 		mbox := plugin.Host(m[0][4]).Normalize()
-		u.getRecord(plugin.Host(m[0][1]).Normalize()).addSOA(ns, mbox, ttl, serial, refresh, retry, expire, minttl)
+		r := makeSOA(name, ns, mbox, ttl, serial, refresh, retry, expire, minttl)
+		u.getRecord(name).addRR(r)
 		return nil
 	}
 	return fmt.Errorf("Invalid local data %s", line)
@@ -129,6 +131,9 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 		log.Fatal(err)
 	}
 	defer file.Close()
+
+	temp := map[string][]dns.A{}
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.ToLower(scanner.Text())
@@ -158,7 +163,7 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 		if strings.Contains(line, "local-data:") {
 			m := u.dataRe.FindAllStringSubmatch(line, 1)
 			if m != nil && len(m) == 1 && len(m[0]) == 2 {
-				err := u.parseAndAddRecord(m[0][1])
+				err := u.parseAndAddRecord(m[0][1], temp)
 				if err != nil {
 					return u, err
 				}
@@ -182,12 +187,11 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 		}
 	}
 	for _, k := range redirectedkeys {
-		r, ok := u.temp[k]
+		r, ok := temp[k]
 		if ok {
-			u.Zones[k].ips = r
+			u.Zones[k].ips = &r
 		}
 	}
-	u.temp = nil
 	return u, nil
 }
 
@@ -201,7 +205,8 @@ func (u *UBDataFile) getRecord(fqdn string) *dnsRecord {
 	return rec
 }
 
-func (d *dnsRecord) addRR(t uint16, r dns.RR) {
+func (d *dnsRecord) addRR(r dns.RR) {
+	t := r.Header().Rrtype
 	_, ok := d.rr[t]
 	if !ok {
 		d.rr[t] = []dns.RR{}
@@ -209,41 +214,41 @@ func (d *dnsRecord) addRR(t uint16, r dns.RR) {
 	d.rr[t] = append(d.rr[t], r)
 }
 
-func (d *dnsRecord) addA(ip string, ttl uint64) {
+func makeA(name, ip string, ttl uint64) *dns.A {
 	r := new(dns.A)
-	r.Hdr = dns.RR_Header{Name: d.fqdn, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(ttl)}
+	r.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(ttl)}
 	r.A = net.ParseIP(ip)
-	d.addRR(dns.TypeA, r)
+	return r
 }
 
-func (d *dnsRecord) addMX(mx string, ttl, pref uint64) {
+func makeMX(name, mx string, ttl, pref uint64) *dns.MX {
 	r := new(dns.MX)
-	r.Hdr = dns.RR_Header{Name: d.fqdn, Rrtype: dns.TypeMX, Class: dns.ClassINET, Ttl: uint32(ttl)}
+	r.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeMX, Class: dns.ClassINET, Ttl: uint32(ttl)}
 	r.Mx = mx
 	r.Preference = uint16(pref)
-	d.addRR(dns.TypeMX, r)
+	return r
 }
 
-func (d *dnsRecord) addPTR(ptr string, ttl uint64) {
+func makePTR(name, ptr string, ttl uint64) *dns.PTR {
 	r := new(dns.PTR)
-	r.Hdr = dns.RR_Header{Name: d.fqdn, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: uint32(ttl)}
+	r.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: uint32(ttl)}
 	r.Ptr = ptr
-	d.addRR(dns.TypePTR, r)
+	return r
 }
 
-func (d *dnsRecord) addSRV(target string, ttl, prio, weight, port uint64) {
+func makeSRV(name, target string, ttl, prio, weight, port uint64) *dns.SRV {
 	r := new(dns.SRV)
-	r.Hdr = dns.RR_Header{Name: d.fqdn, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: uint32(ttl)}
+	r.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: uint32(ttl)}
 	r.Target = target
 	r.Priority = uint16(prio)
 	r.Port = uint16(port)
 	r.Weight = uint16(weight)
-	d.addRR(dns.TypeSRV, r)
+	return r
 }
 
-func (d *dnsRecord) addSOA(ns, mbox string, ttl, serial, refresh, retry, expire, minttl uint64) {
+func makeSOA(name, ns, mbox string, ttl, serial, refresh, retry, expire, minttl uint64) *dns.SOA {
 	r := new(dns.SOA)
-	r.Hdr = dns.RR_Header{Name: d.fqdn, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: uint32(ttl)}
+	r.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: uint32(ttl)}
 	r.Ns = ns
 	r.Mbox = mbox
 	r.Serial = uint32(serial)
@@ -251,5 +256,5 @@ func (d *dnsRecord) addSOA(ns, mbox string, ttl, serial, refresh, retry, expire,
 	r.Retry = uint32(retry)
 	r.Expire = uint32(expire)
 	r.Minttl = uint32(minttl)
-	d.addRR(dns.TypeSOA, r)
+	return r
 }
