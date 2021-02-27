@@ -81,6 +81,7 @@ func (u UBFile) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 					return dns.RcodeSuccess, nil
 				}
 				// make a copy of the rr records
+				// TODO we have a bug here , if redirected domain has rrs that we do not support configured, it would cause a SERVFAIL
 				newlist := make([]dns.RR, len(rlist))
 				for i := 0; i < len(newlist); i++ {
 					var r dns.RR
