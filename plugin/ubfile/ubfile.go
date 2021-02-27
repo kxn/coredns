@@ -30,25 +30,9 @@ func (u UBFile) returnNXDomain(source *dns.Msg, w dns.ResponseWriter, zonename s
 	zrecs, ok := u.uBData.Records[zonename]
 	var zlist []dns.RR = nil
 	if ok {
-		zl, ok := zrecs.rr[dns.TypeSOA]
-		if ok {
-			zlist = zl
-		}
+		zlist = zrecs.rr[dns.TypeSOA]
 	}
-	if zlist == nil {
-		// craft one using default parameter
-		soa := new(dns.SOA)
-		soa.Hdr = dns.RR_Header{Name: zonename, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 86400}
-		soa.Ns = zonename
-		soa.Mbox = "admin." + zonename
-		soa.Serial = 2021022301
-		soa.Refresh = 600
-		soa.Retry = 3600
-		soa.Expire = 604800
-		soa.Minttl = 86400
-		zlist = make([]dns.RR, 1)
-		zlist[0] = soa
-	}
+
 	m := new(dns.Msg)
 	m.SetReply(source)
 	m.Rcode = dns.RcodeNameError
@@ -63,17 +47,10 @@ func (u UBFile) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	state := request.Request{W: w, Req: r}
 	qname := strings.ToLower(state.Req.Question[0].Name)
 
-	//answers := []dns.RR{}
 	recs, ok := u.uBData.Records[qname]
 	if ok {
-		switch state.QType() {
-		case dns.TypeA, dns.TypeMX, dns.TypeSRV, dns.TypePTR, dns.TypeSOA:
-			rlist, ok := recs.rr[state.QType()]
-			if ok {
-				u.returnOK(r, w, rlist)
-				return dns.RcodeSuccess, nil
-			}
-		}
+		u.returnOK(r, w, recs.rr[state.QType()])
+		return dns.RcodeSuccess, nil
 	}
 	var (
 		off int
@@ -90,22 +67,17 @@ func (u UBFile) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 				// break and next
 				break
 			case zoneRedirect:
-				// only lookup for A/PTR/MX type questions, otherwise make it NXDOMAIN
-				switch state.QType() {
-				case dns.TypeA, dns.TypePTR, dns.TypeMX:
-				default:
-					u.returnNXDomain(r, w, zone.fqdn)
-					return dns.RcodeSuccess, nil
-				}
 				// back lookup zone name in hosts
 				recs, ok := u.uBData.Records[zone.fqdn]
 				if !ok {
-					u.returnNXDomain(r, w, zone.fqdn)
+					// looks like we have a zone configured as redirect but without any records
+					u.returnOK(r, w, nil)
 					return dns.RcodeSuccess, nil
 				}
 				rlist, ok := recs.rr[state.QType()]
 				if !ok {
-					u.returnNXDomain(r, w, zone.fqdn)
+					// We have the domain configured, but without the type requested
+					u.returnOK(r, w, nil)
 					return dns.RcodeSuccess, nil
 				}
 				// make a copy of the rr records
