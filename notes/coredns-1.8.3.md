@@ -1,15 +1,18 @@
 +++
-title = "CoreDNS-1.8.2 Release"
-description = "CoreDNS-1.8.2 Release Notes."
-tags = ["Release", "1.8.2", "Notes"]
-release = "1.8.2"
-date = 2021-02-23T07:00:00+00:00
+title = "CoreDNS-1.8.3 Release"
+description = "CoreDNS-1.8.3 Release Notes."
+tags = ["Release", "1.8.3", "Notes"]
+release = "1.8.3"
+date = 2021-02-24T07:00:00+00:00
 author = "coredns"
 +++
 
 The CoreDNS team has released
-[CoreDNS-1.8.2](https://github.com/coredns/coredns/releases/tag/v1.8.2). This release includes a
+[CoreDNS-1.8.3](https://github.com/coredns/coredns/releases/tag/v1.8.3). This release includes a
 bunch of bugfixes and a few enhancements, see below.
+
+In case you're wondering, 1.8.2 didn't properly upload and tag the docker images, hence a quick
+followup release with that fixed.
 
 ## Brought to You By
 
@@ -33,6 +36,7 @@ TimYin.
 * core: Flag blacklisting not needed anymore (https://github.com/coredns/coredns/pull/4420)
 * core: Set http request in writer (https://github.com/coredns/coredns/pull/4445)
 * Makefile.release: Replace manifest-tool with docker manifest (https://github.com/coredns/coredns/pull/4421)
+* Makefile.release: Fix the Makefile (https://github.com/coredns/coredns/pull/4483)
 * plugin/acl: add the ability to filter records (https://github.com/coredns/coredns/pull/4389)
 * plugin/dnstap: Fix out of order messages and fix forward perspective. (https://github.com/coredns/coredns/pull/4395)
 * plugin/forward Add rcode and rtype to request_duration_seconds metric (https://github.com/coredns/coredns/pull/4391)
