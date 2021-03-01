@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/miekg/dns"
@@ -27,8 +29,11 @@ const (
 )
 
 type dnsZone struct {
-	fqdn     string
-	zonetype zoneType
+	fqdn              string
+	zonetype          zoneType
+	redirectedRecord  *dnsRecord
+	needRandomlizeARR bool
+	parent            *UBDataFile
 }
 
 // UBDataFile  hold everything the unbound file knows
@@ -36,9 +41,11 @@ type UBDataFile struct {
 	Records                                        map[string]*dnsRecord
 	Zones                                          map[string]*dnsZone
 	zoneRe, dataRe, soaRe, mxRe, aRe, ptrRe, srvRe *regexp.Regexp
+	allocatedIPIndex                               int32
+	allocatedIPs                                   sync.Map
 }
 
-func newUBDataFile() UBDataFile {
+func newUBDataFile() *UBDataFile {
 	ret := UBDataFile{
 		Records: map[string]*dnsRecord{},
 		Zones:   map[string]*dnsZone{},
@@ -51,7 +58,11 @@ func newUBDataFile() UBDataFile {
 	ret.soaRe = regexp.MustCompile(`([^\s]+)\s+([\d]+)\s+in\s+soa\s+([^\s]+)\s+([^\s]+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)`)
 	ret.srvRe = regexp.MustCompile(`([^\s]+)\s+([\d]+)\s+in\s+srv\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+([^\s]+)`)
 	ret.ptrRe = regexp.MustCompile(`([^\s]+)\s+([\d]+)\s+in\s+ptr\s+([^\s]+)`)
-	return ret
+
+	ret.allocatedIPIndex = 0
+	ret.allocatedIPs = sync.Map{}
+
+	return &ret
 }
 
 func (u *UBDataFile) parseAndAddRecord(line string) error {
@@ -117,7 +128,7 @@ func (u *UBDataFile) parseAndAddRecord(line string) error {
 }
 
 // LoadUBFile create from file
-func LoadUBFile(filepath string) (UBDataFile, error) {
+func LoadUBFile(filepath string) (*UBDataFile, error) {
 	u := newUBDataFile()
 	file, err := os.Open(filepath)
 	if err != nil {
@@ -131,7 +142,7 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 		if strings.Contains(line, "local-zone:") {
 			m := u.zoneRe.FindAllStringSubmatch(line, 1)
 			if m != nil && len(m) == 1 && len(m[0]) == 3 {
-				zone := dnsZone{fqdn: plugin.Host(m[0][1]).Normalize()}
+				zone := newZone(plugin.Host(m[0][1]).Normalize(), u)
 				_, ok := u.Zones[zone.fqdn]
 				if ok {
 					return u, fmt.Errorf("Duplicate zone %s of line '%s'", zone.fqdn, line)
@@ -169,7 +180,49 @@ func LoadUBFile(filepath string) (UBDataFile, error) {
 	if scanner.Err() != nil {
 		return u, scanner.Err()
 	}
+	// Scan for all redirected zones, and populate redirected pointers
+	redirectedzones := []string{}
+	for k, v := range u.Zones {
+		if v.zonetype == zoneRedirect {
+			redirectedzones = append(redirectedzones, k)
+		}
+	}
+	// use all zero ip as randomlized ip
+	for _, k := range redirectedzones {
+		rr, ok := u.Records[k]
+		if ok {
+			u.Zones[k].redirectedRecord = rr
+			if hasRandomizedARecord(rr) {
+				u.Zones[k].needRandomlizeARR = true
+			}
+		}
+	}
+	// pre-allocate all randomlized ip
+	allrecordkeys := []string{}
+	for k := range u.Records {
+		allrecordkeys = append(allrecordkeys, k)
+	}
+	for _, k := range allrecordkeys {
+		if hasRandomizedARecord(u.Records[k]) {
+			u.Records[k].rr[dns.TypeA] = u.allocateIP(k)
+		}
+	}
+
 	return u, nil
+}
+
+func hasRandomizedARecord(r *dnsRecord) bool {
+	zeroip := net.IPv4(0, 0, 0, 0)
+	arecords, ok := r.rr[dns.TypeA]
+	if ok {
+		for _, aitem := range arecords {
+			a, ok := aitem.(*dns.A)
+			if ok && a.A.Equal(zeroip) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (u *UBDataFile) getRecord(fqdn string) *dnsRecord {
@@ -180,6 +233,60 @@ func (u *UBDataFile) getRecord(fqdn string) *dnsRecord {
 	u.Records[fqdn] = &dnsRecord{fqdn: fqdn, rr: map[uint16][]dns.RR{}}
 	rec = u.Records[fqdn]
 	return rec
+}
+
+func (u *UBDataFile) allocateIP(name string) []dns.RR {
+	r, ok := u.allocatedIPs.Load(name)
+	if ok {
+		return r.([]dns.RR)
+	}
+	rr := []dns.RR{}
+	arecord := new(dns.A)
+	arecord.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600}
+	c := atomic.AddInt32(&u.allocatedIPIndex, 1)
+	c1 := c / 256
+	c2 := c % 256
+	arecord.A = net.IPv4(172, 16, byte(c1), byte(c2))
+	rr = append(rr, arecord)
+	u.allocatedIPs.Store(name, rr)
+	return rr
+}
+
+func newZone(fqdn string, u *UBDataFile) dnsZone {
+	r := dnsZone{fqdn: fqdn}
+	r.needRandomlizeARR = false
+	r.redirectedRecord = nil
+	r.zonetype = zoneStatic
+	r.parent = u
+	return r
+}
+
+// GetRedirectedRecord
+func (z *dnsZone) GetRedirectedRecord(qname string, qtype uint16) []dns.RR {
+	if z.redirectedRecord == nil {
+		return nil
+	}
+	rrs := z.redirectedRecord.rr[qtype]
+	if rrs == nil {
+		return nil
+	}
+	if qtype == dns.TypeA && z.needRandomlizeARR {
+		return z.parent.allocateIP(qname)
+	}
+	newlist := make([]dns.RR, len(rrs))
+	for i := 0; i < len(newlist); i++ {
+		var r dns.RR
+		switch qtype {
+		case dns.TypeA:
+			r = copyA(qname, rrs[i])
+		case dns.TypeMX:
+			r = copyMX(qname, rrs[i])
+		case dns.TypePTR:
+			r = copyPTR(qname, rrs[i])
+		}
+		newlist[i] = r
+	}
+	return newlist
 }
 
 func (d *dnsRecord) addRR(r dns.RR) {

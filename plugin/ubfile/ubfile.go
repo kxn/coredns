@@ -13,7 +13,7 @@ import (
 // UBFile is a unbound localdata file plugin
 type UBFile struct {
 	Next   plugin.Handler
-	uBData UBDataFile
+	uBData *UBDataFile
 }
 
 func (u UBFile) returnOK(source *dns.Msg, w dns.ResponseWriter, answers []dns.RR) {
@@ -67,38 +67,7 @@ func (u UBFile) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 				// break and next
 				break
 			case zoneRedirect:
-				// back lookup zone name in hosts
-				recs, ok := u.uBData.Records[zone.fqdn]
-				if !ok {
-					// looks like we have a zone configured as redirect but without any records
-					u.returnOK(r, w, nil)
-					return dns.RcodeSuccess, nil
-				}
-				rlist, ok := recs.rr[state.QType()]
-				if !ok {
-					// We have the domain configured, but without the type requested
-					u.returnOK(r, w, nil)
-					return dns.RcodeSuccess, nil
-				}
-				// make a copy of the rr records
-				// TODO we have a bug here , if redirected domain has rrs that we do not support configured, it would cause a SERVFAIL
-				newlist := make([]dns.RR, len(rlist))
-				for i := 0; i < len(newlist); i++ {
-					var r dns.RR
-					switch state.QType() {
-					case dns.TypeA:
-						r = copyA(qname, rlist[i])
-					case dns.TypeMX:
-						r = copyMX(qname, rlist[i])
-					case dns.TypePTR:
-						r = copyPTR(qname, rlist[i])
-					}
-					if r == nil {
-						return dns.RcodeServerFailure, nil
-					}
-					newlist[i] = r
-				}
-				u.returnOK(r, w, newlist)
+				u.returnOK(r, w, zone.GetRedirectedRecord(qname, state.QType()))
 				return dns.RcodeSuccess, nil
 			}
 		}
