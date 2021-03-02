@@ -49,6 +49,9 @@ func (u UBFile) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 
 	recs, ok := u.uBData.Records[qname]
 	if ok {
+		if recs.zone != nil && recs.zone.zonetype == zoneTransparent && recs.rr[state.QType()] == nil {
+			return plugin.NextOrFailure(u.Name(), u.Next, ctx, w, r)
+		}
 		u.returnOK(r, w, recs.rr[state.QType()])
 		return dns.RcodeSuccess, nil
 	}
@@ -64,8 +67,7 @@ func (u UBFile) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 				u.returnNXDomain(r, w, zone.fqdn)
 				return dns.RcodeSuccess, nil
 			case zoneTransparent:
-				// break and next
-				break
+				return plugin.NextOrFailure(u.Name(), u.Next, ctx, w, r)
 			case zoneRedirect:
 				u.returnOK(r, w, zone.GetRedirectedRecord(qname, state.QType()))
 				return dns.RcodeSuccess, nil

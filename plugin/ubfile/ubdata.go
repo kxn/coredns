@@ -18,6 +18,7 @@ import (
 type dnsRecord struct {
 	fqdn string
 	rr   map[uint16][]dns.RR
+	zone *dnsZone
 }
 
 type zoneType int8
@@ -207,6 +208,23 @@ func LoadUBFile(filepath string) (*UBDataFile, error) {
 			u.Records[k].rr[dns.TypeA] = u.allocateIP(k)
 		}
 	}
+	// Refill the zone information for all records
+	for _, k := range allrecordkeys {
+		var (
+			off int
+			end bool
+		)
+		for {
+			if zone, ok := u.Zones[k[off:]]; ok {
+				u.Records[k].zone = zone
+				break
+			}
+			off, end = dns.NextLabel(k, off)
+			if end {
+				break
+			}
+		}
+	}
 
 	return u, nil
 }
@@ -230,7 +248,7 @@ func (u *UBDataFile) getRecord(fqdn string) *dnsRecord {
 	if ok {
 		return rec
 	}
-	u.Records[fqdn] = &dnsRecord{fqdn: fqdn, rr: map[uint16][]dns.RR{}}
+	u.Records[fqdn] = &dnsRecord{fqdn: fqdn, rr: map[uint16][]dns.RR{}, zone: nil}
 	rec = u.Records[fqdn]
 	return rec
 }
