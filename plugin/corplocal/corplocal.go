@@ -194,6 +194,12 @@ func (l CorpLocal) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		returnNXDomain(r, w)
 		return dns.RcodeNameError, nil
 	case dns.TypeA:
+		// reject A/AAAA queries for in-addr.arpa and in6.arpa
+		if strings.HasSuffix(qname, ".in-addr.arpa.") || strings.HasSuffix(qname, ".in6.arpa.") {
+			returnNXDomain(r, w)
+			return dns.RcodeNameError, nil
+		}
+
 		if strings.HasSuffix(qname, l.corpDomain) {
 			ip := net.ParseIP(strings.TrimSuffix(qname, l.corpDomain))
 			// Do parse and return A
@@ -206,6 +212,13 @@ func (l CorpLocal) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			return dns.RcodeNameError, nil
 		}
 	case dns.TypeAAAA:
+
+		// reject A/AAAA queries for in-addr.arpa and in6.arpa
+		if strings.HasSuffix(qname, ".in-addr.arpa.") || strings.HasSuffix(qname, ".in6.arpa.") {
+			returnNXDomain(r, w)
+			return dns.RcodeNameError, nil
+		}
+
 		if strings.HasSuffix(qname, l.corpDomainV6) {
 			ip6 := net.ParseIP(strings.ReplaceAll(strings.TrimSuffix(qname, l.corpDomainV6), ".", ":"))
 			if ip6 != nil {
@@ -215,6 +228,7 @@ func (l CorpLocal) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			returnNXDomain(r, w)
 			return dns.RcodeNameError, nil
 		}
+
 	}
 	return plugin.NextOrFailure(l.Name(), l.Next, ctx, w, r)
 }
