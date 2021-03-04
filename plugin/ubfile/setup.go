@@ -1,7 +1,6 @@
 package ubfile
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"strconv"
@@ -19,6 +18,7 @@ func init() { plugin.Register("ubfile", setup) }
 func setup(c *caddy.Controller) error {
 	u := UBFile{}
 	i := 0
+	var randomv4ttl, randomv6ttl uint32
 	for c.Next() {
 		if i > 0 {
 			return plugin.ErrOnce
@@ -39,14 +39,9 @@ func setup(c *caddy.Controller) error {
 				if err != nil {
 					return err
 				}
-				// very ugly hack...
-				switch len(n.IP) {
-				case net.IPv4len:
-					f.randomV4Prefix = binary.BigEndian.Uint32(n.IP)
-				case net.IPv6len:
-					f.randomV4Prefix = binary.BigEndian.Uint32(n.IP[12:])
-				default:
-					return fmt.Errorf("Internal error")
+				f.v4Allocator, err = NewV4PrefixAddAllocator(n, 5)
+				if err != nil {
+					return err
 				}
 			case "randomv6prefix":
 				if !c.NextArg() {
@@ -56,36 +51,37 @@ func setup(c *caddy.Controller) error {
 				if err != nil {
 					return err
 				}
-				switch len(n.IP) {
-				case net.IPv4len:
-					return fmt.Errorf("%s is not a valid ipv6 prefix", c.Val())
-				case net.IPv6len:
-					f.randomV6Prefix = binary.BigEndian.Uint64(n.IP)
-				default:
-					return fmt.Errorf("Internal error")
-				}
+				f.v6Allocator, err = NewV6AddAllocator(n, 5)
 			case "randomv4ttl":
 				if !c.NextArg() {
 					return c.ArgErr()
 				}
-				v, err := strconv.ParseUint(c.Val(), 10, 16)
+				v, err := strconv.ParseUint(c.Val(), 10, 32)
 				if err != nil {
 					return fmt.Errorf("%s is not a valid ttl", c.Val())
 				}
-				f.randomV4Ttl = uint16(v)
+				randomv4ttl = uint32(v)
 			case "randomv6ttl":
 				if !c.NextArg() {
 					return c.ArgErr()
 				}
-				v, err := strconv.ParseUint(c.Val(), 10, 16)
+				v, err := strconv.ParseUint(c.Val(), 10, 32)
 				if err != nil {
 					return fmt.Errorf("%s is not a valid ttl", c.Val())
 				}
-				f.randomV6Ttl = uint16(v)
+				randomv6ttl = uint32(v)
 			default:
 				return c.ArgErr()
 			}
 		}
+		if f.v4Allocator != nil && randomv4ttl != 0 {
+			f.v4Allocator.SetTTL(randomv4ttl)
+		}
+
+		if f.v6Allocator != nil && randomv6ttl != 0 {
+			f.v6Allocator.SetTTL(randomv6ttl)
+		}
+
 		err := f.LoadFile(filename)
 		if err != nil {
 			return err

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os"
 	"regexp"
@@ -39,16 +40,18 @@ type dnsZone struct {
 	parent               *UBDataFile
 }
 
+// IPAllocator allocates an IP from its name
+type IPAllocator interface {
+	AllocateIP(name string) []dns.RR
+	SetTTL(ttl uint32)
+}
+
 // UBDataFile  hold everything the unbound file knows
 type UBDataFile struct {
 	Records                                                map[string]*dnsRecord
 	Zones                                                  map[string]*dnsZone
 	zoneRe, dataRe, soaRe, mxRe, aRe, aaaaRe, ptrRe, srvRe *regexp.Regexp
-	allocatedV4IPIndex, allocatedV6IPIndex                 uint32
-	allocatedV4IPs, allocatedV6IPs                         sync.Map
-	randomV4Prefix                                         uint32
-	randomV6Prefix                                         uint64
-	randomV4Ttl, randomV6Ttl                               uint16
+	v4Allocator, v6Allocator                               IPAllocator
 	randomV4IP, randomV6IP                                 net.IP
 }
 
@@ -68,16 +71,11 @@ func NewUBDataFile() *UBDataFile {
 	ret.srvRe = regexp.MustCompile(`([^\s]+)\s+([\d]+)\s+in\s+srv\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+([^\s]+)`)
 	ret.ptrRe = regexp.MustCompile(`([^\s]+)\s+([\d]+)\s+in\s+ptr\s+([^\s]+)`)
 
-	ret.allocatedV4IPIndex = 0
-	ret.allocatedV6IPIndex = 0
-	ret.allocatedV4IPs = sync.Map{}
-	ret.allocatedV6IPs = sync.Map{}
-	ret.randomV4Prefix = 0
-	ret.randomV6Prefix = 0
-	ret.randomV4Ttl = 5
-	ret.randomV6Ttl = 5
+	ret.v4Allocator = nil
+	ret.v6Allocator = nil
 	ret.randomV4IP = make(net.IP, net.IPv4len)
 	ret.randomV6IP = make(net.IP, net.IPv6len)
+
 	return &ret
 }
 
@@ -230,16 +228,16 @@ func (u *UBDataFile) LoadFile(filepath string) error {
 	}
 	for _, k := range allrecordkeys {
 		if u.hasRandomizedARecord(u.Records[k]) {
-			if u.randomV4Prefix == 0 {
+			if u.v4Allocator == nil {
 				return fmt.Errorf("data contains randomlized IP %s, but randomv4prefix has not been specified", u.randomV4IP.String())
 			}
-			u.Records[k].rr[dns.TypeA] = u.allocateV4IP(k)
+			u.Records[k].rr[dns.TypeA] = u.v4Allocator.AllocateIP(k)
 		}
 		if u.hasRandomizedAAAARecord(u.Records[k]) {
-			if u.randomV6Prefix == 0 {
+			if u.v6Allocator == nil {
 				return fmt.Errorf("data contains randomlized IPv6 %s, but randomv6prefix has not been specified", u.randomV6IP.String())
 			}
-			u.Records[k].rr[dns.TypeAAAA] = u.allocateV6IP(k)
+			u.Records[k].rr[dns.TypeAAAA] = u.v6Allocator.AllocateIP(k)
 		}
 
 	}
@@ -300,37 +298,6 @@ func (u *UBDataFile) getRecord(fqdn string) *dnsRecord {
 	return rec
 }
 
-func (u *UBDataFile) allocateV4IP(name string) []dns.RR {
-	r, ok := u.allocatedV4IPs.Load(name)
-	if ok {
-		return r.([]dns.RR)
-	}
-	rr := []dns.RR{}
-	arecord := new(dns.A)
-	arecord.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(u.randomV4Ttl)}
-	c := u.randomV4Prefix + atomic.AddUint32(&u.allocatedV4IPIndex, 1)
-	arecord.A = make(net.IP, net.IPv4len)
-	binary.BigEndian.PutUint32(arecord.A, uint32(c))
-	rr = append(rr, arecord)
-	u.allocatedV4IPs.Store(name, rr)
-	return rr
-}
-
-func (u *UBDataFile) allocateV6IP(name string) []dns.RR {
-	r, ok := u.allocatedV6IPs.Load(name)
-	if ok {
-		return r.([]dns.RR)
-	}
-	rr := []dns.RR{}
-	arecord := new(dns.AAAA)
-	arecord.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: uint32(u.randomV6Ttl)}
-	arecord.AAAA = make(net.IP, net.IPv6len)
-	binary.BigEndian.PutUint64(arecord.AAAA, u.randomV6Prefix)
-	binary.BigEndian.PutUint64(arecord.AAAA[8:], uint64(atomic.AddUint32(&u.allocatedV6IPIndex, 1)))
-	rr = append(rr, arecord)
-	u.allocatedV6IPs.Store(name, rr)
-	return rr
-}
 func newZone(fqdn string, u *UBDataFile) dnsZone {
 	r := dnsZone{fqdn: fqdn}
 	r.needRandomlizeARR = false
@@ -350,10 +317,10 @@ func (z *dnsZone) GetRedirectedRecord(qname string, qtype uint16) []dns.RR {
 		return nil
 	}
 	if qtype == dns.TypeA && z.needRandomlizeARR {
-		return z.parent.allocateV4IP(qname)
+		return z.parent.v4Allocator.AllocateIP(qname)
 	}
 	if qtype == dns.TypeAAAA && z.needRandomlizeAAAARR {
-		return z.parent.allocateV6IP(qname)
+		return z.parent.v6Allocator.AllocateIP(qname)
 	}
 
 	newlist := make([]dns.RR, len(rrs))
@@ -381,6 +348,193 @@ func (d *dnsRecord) addRR(r dns.RR) {
 		d.rr[t] = []dns.RR{}
 	}
 	d.rr[t] = append(d.rr[t], r)
+}
+
+// IPv4AddAllocator do
+type IPv4AddAllocator struct {
+	allocated     sync.Map
+	allocatedBase uint64
+	start         uint64
+	end           uint64
+	ttl           uint32
+}
+
+// NewV4PrefixAddAllocator do
+func NewV4PrefixAddAllocator(n *net.IPNet, ttl uint32) (IPAllocator, error) {
+	var start, mask, end uint32
+	switch len(n.IP) {
+	case net.IPv4len:
+		start = binary.BigEndian.Uint32(n.IP)
+		mask = binary.BigEndian.Uint32(n.Mask)
+	case net.IPv6len:
+		start = binary.BigEndian.Uint32(n.IP[12:])
+		mask = binary.BigEndian.Uint32(n.Mask[12:])
+	default:
+		return nil, fmt.Errorf("Internal error")
+	}
+	end = (^mask) | start
+	return &IPv4AddAllocator{
+		allocated:     sync.Map{},
+		allocatedBase: uint64(start),
+		start:         uint64(start),
+		end:           uint64(end),
+		ttl:           ttl,
+	}, nil
+}
+
+// NewV4StartEndAddAllocator do
+func NewV4StartEndAddAllocator(startv, endv net.IP, ttl uint32) (IPAllocator, error) {
+	var start, end uint32
+	switch len(startv) {
+	case net.IPv4len:
+		start = binary.BigEndian.Uint32(startv)
+	case net.IPv6len:
+		start = binary.BigEndian.Uint32(startv[12:])
+	default:
+		return nil, fmt.Errorf("Internal error")
+	}
+
+	switch len(endv) {
+	case net.IPv4len:
+		end = binary.BigEndian.Uint32(endv)
+	case net.IPv6len:
+		end = binary.BigEndian.Uint32(endv[12:])
+	default:
+		return nil, fmt.Errorf("Internal error")
+	}
+	start = start - 1
+	if start <= end {
+		return nil, fmt.Errorf("End %d must > start %d", start, end)
+	}
+
+	return &IPv4AddAllocator{
+		allocated:     sync.Map{},
+		allocatedBase: uint64(start),
+		start:         uint64(start),
+		end:           uint64(end),
+		ttl:           ttl,
+	}, nil
+}
+
+// AllocateIP do
+func (v *IPv4AddAllocator) AllocateIP(name string) []dns.RR {
+	r, ok := v.allocated.Load(name)
+	if ok {
+		return r.([]dns.RR)
+	}
+	rr := []dns.RR{}
+	arecord := new(dns.A)
+	arecord.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(v.ttl)}
+	c := atomic.AddUint64(&(v.allocatedBase), 1)
+	if c >= v.end {
+		c = v.start + 1
+		atomic.StoreUint64(&(v.allocatedBase), c)
+	}
+	arecord.A = make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(arecord.A, uint32(c))
+	rr = append(rr, arecord)
+	v.allocated.Store(name, rr)
+	return rr
+}
+
+// SetTTL do
+func (v *IPv4AddAllocator) SetTTL(ttl uint32) {
+	v.ttl = ttl
+}
+
+// IPv6AddAllocator do
+type IPv6AddAllocator struct {
+	allocated     sync.Map
+	allocatedBase uint64
+	prefix        uint64
+	start         uint64
+	end           uint64
+	ttl           uint32
+}
+
+// NewV6AddAllocator do
+func NewV6AddAllocator(prefix *net.IPNet, ttl uint32) (IPAllocator, error) {
+	ones, bits := prefix.Mask.Size()
+	if bits != 128 || ones < 64 {
+		return nil, fmt.Errorf("add V6 randomip must use ipv6 prefix which is longer or equal than /64")
+	}
+	start := binary.BigEndian.Uint64(prefix.IP[8:])
+	mask := binary.BigEndian.Uint64(prefix.Mask[8:])
+	end := (^mask) | start
+	return &IPv6AddAllocator{
+		allocated:     sync.Map{},
+		allocatedBase: start,
+		start:         start,
+		end:           end,
+		prefix:        binary.BigEndian.Uint64(prefix.IP),
+		ttl:           ttl,
+	}, nil
+}
+
+// AllocateIP do
+func (v *IPv6AddAllocator) AllocateIP(name string) []dns.RR {
+	r, ok := v.allocated.Load(name)
+	if ok {
+		return r.([]dns.RR)
+	}
+	rr := []dns.RR{}
+	arecord := new(dns.AAAA)
+	arecord.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: uint32(v.ttl)}
+	arecord.AAAA = make(net.IP, net.IPv6len)
+	binary.BigEndian.PutUint64(arecord.AAAA, v.prefix)
+	// we have overflow risk here, but who cares...
+	c := atomic.AddUint64(&(v.allocatedBase), 1)
+	if c >= v.end {
+		// Do wrap
+		c = v.start + 1
+		atomic.StoreUint64(&(v.allocatedBase), c)
+	}
+	binary.BigEndian.PutUint64(arecord.AAAA[8:], c)
+	rr = append(rr, arecord)
+	v.allocated.Store(name, rr)
+	return rr
+}
+
+// SetTTL do
+func (v *IPv6AddAllocator) SetTTL(ttl uint32) {
+	v.ttl = ttl
+}
+
+// IPv6HashAllocator do
+type IPv6HashAllocator struct {
+	prefix uint64
+	ttl    uint32
+}
+
+// NewV6HashAllocator do
+func NewV6HashAllocator(prefix *net.IPNet, ttl uint32) (IPAllocator, error) {
+	ones, bits := prefix.Mask.Size()
+	if bits != 128 || ones != 64 {
+		return nil, fmt.Errorf("hash V6 randomip must use /64 ipv6 prefix")
+	}
+	return &IPv6HashAllocator{
+		prefix: binary.BigEndian.Uint64(prefix.IP),
+		ttl:    ttl,
+	}, nil
+}
+
+// AllocateIP do
+func (v *IPv6HashAllocator) AllocateIP(name string) []dns.RR {
+	rr := []dns.RR{}
+	arecord := new(dns.AAAA)
+	arecord.Hdr = dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: uint32(v.ttl)}
+	arecord.AAAA = make(net.IP, net.IPv6len)
+	binary.BigEndian.PutUint64(arecord.AAAA, v.prefix)
+	h := fnv.New64()
+	h.Write([]byte(name))
+	binary.BigEndian.PutUint64(arecord.AAAA[8:], h.Sum64())
+	rr = append(rr, arecord)
+	return rr
+}
+
+// SetTTL do
+func (v *IPv6HashAllocator) SetTTL(ttl uint32) {
+	v.ttl = ttl
 }
 
 func makeA(name, ip string, ttl uint64) *dns.A {
