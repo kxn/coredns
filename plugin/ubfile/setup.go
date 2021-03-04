@@ -3,6 +3,7 @@ package ubfile
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 
 	"github.com/coredns/caddy"
@@ -15,10 +16,21 @@ var log = clog.NewWithPlugin("ubfile")
 
 func init() { plugin.Register("ubfile", setup) }
 
+func parseTTL(c *caddy.Controller) (uint32, error) {
+	ttl := uint64(5)
+	if c.NextArg() {
+		t, err := strconv.ParseUint(c.Val(), 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("Invalid ttl value %s", c.Val())
+		}
+		ttl = t
+	}
+	return uint32(ttl), nil
+}
+
 func setup(c *caddy.Controller) error {
 	u := UBFile{}
 	i := 0
-	var randomv4ttl, randomv6ttl uint32
 	for c.Next() {
 		if i > 0 {
 			return plugin.ErrOnce
@@ -31,7 +43,51 @@ func setup(c *caddy.Controller) error {
 		}
 		for c.NextBlock() {
 			switch c.Val() {
-			case "randomv4prefix":
+			case "randomv4":
+				if !c.NextArg() {
+					return c.ArgErr()
+				}
+				addrs := c.Val()
+				re := regexp.MustCompile(`([\d\.]+)-([\d\.]+)`)
+				m := re.FindAllStringSubmatch(addrs, 1)
+				if m != nil {
+					start := net.ParseIP(m[0][1])
+					end := net.ParseIP(m[0][2])
+					if start == nil || end == nil {
+						return fmt.Errorf("Unable to parse start ip %s or end ip %s", m[0][1], m[0][2])
+					}
+					ttl, err := parseTTL(c)
+					if err != nil {
+						return err
+					}
+					f.v4Allocator, err = NewV4StartEndAddAllocator(start, end, ttl)
+					if err != nil {
+						return err
+					}
+
+				} else {
+					_, n, err := net.ParseCIDR(c.Val())
+					if err != nil {
+						return err
+					}
+					var ttl uint32
+					ttl, err = parseTTL(c)
+					if err != nil {
+						return err
+					}
+
+					f.v4Allocator, err = NewV4PrefixAddAllocator(n, ttl)
+					if err != nil {
+						return err
+					}
+
+				}
+				// can not have more args
+				if c.NextArg() {
+					return c.ArgErr()
+				}
+
+			case "randomv6":
 				if !c.NextArg() {
 					return c.ArgErr()
 				}
@@ -39,47 +95,32 @@ func setup(c *caddy.Controller) error {
 				if err != nil {
 					return err
 				}
-				f.v4Allocator, err = NewV4PrefixAddAllocator(n, 5)
+				var ttl uint32
+				ttl, err = parseTTL(c)
 				if err != nil {
 					return err
 				}
-			case "randomv6prefix":
-				if !c.NextArg() {
-					return c.ArgErr()
+				if c.NextArg() {
+					switch c.Val() {
+					case "add":
+						f.v6Allocator, err = NewV6AddAllocator(n, ttl)
+					case "hash":
+						f.v6Allocator, err = NewV6HashAllocator(n, ttl)
+					}
+				} else {
+					// defaults to add
+					f.v6Allocator, err = NewV6AddAllocator(n, ttl)
 				}
-				_, n, err := net.ParseCIDR(c.Val())
 				if err != nil {
 					return err
 				}
-				f.v6Allocator, err = NewV6AddAllocator(n, 5)
-			case "randomv4ttl":
-				if !c.NextArg() {
+				// can not have more args
+				if c.NextArg() {
 					return c.ArgErr()
 				}
-				v, err := strconv.ParseUint(c.Val(), 10, 32)
-				if err != nil {
-					return fmt.Errorf("%s is not a valid ttl", c.Val())
-				}
-				randomv4ttl = uint32(v)
-			case "randomv6ttl":
-				if !c.NextArg() {
-					return c.ArgErr()
-				}
-				v, err := strconv.ParseUint(c.Val(), 10, 32)
-				if err != nil {
-					return fmt.Errorf("%s is not a valid ttl", c.Val())
-				}
-				randomv6ttl = uint32(v)
 			default:
 				return c.ArgErr()
 			}
-		}
-		if f.v4Allocator != nil && randomv4ttl != 0 {
-			f.v4Allocator.SetTTL(randomv4ttl)
-		}
-
-		if f.v6Allocator != nil && randomv6ttl != 0 {
-			f.v6Allocator.SetTTL(randomv6ttl)
 		}
 
 		err := f.LoadFile(filename)
