@@ -403,8 +403,8 @@ func NewV4StartEndAddAllocator(startv, endv net.IP, ttl uint32) (IPAllocator, er
 		return nil, fmt.Errorf("Internal error")
 	}
 	start = start - 1
-	if start <= end {
-		return nil, fmt.Errorf("End %d must > start %d", start, end)
+	if start > end {
+		return nil, fmt.Errorf("end %s must > start %s", startv.String(), endv.String())
 	}
 
 	return &IPv4AddAllocator{
