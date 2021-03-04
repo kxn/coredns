@@ -154,7 +154,7 @@ func (l CorpLocal) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 			ip = reverseByteArray(ip)
 			// should only process intranet and local IPs, maybe carrier grade lan IP as well ?
 			if isIPIntranet(ip) {
-				returnOK(r, w, append([]dns.RR{}, makePTR(qname, ip.String()+l.corpDomain, ttl)))
+				returnOK(r, w, append([]dns.RR{}, makePTR(qname, strings.ReplaceAll(ip.String(), ".", "-")+l.corpDomain, ttl)))
 				return dns.RcodeSuccess, nil
 
 			}
@@ -184,7 +184,7 @@ func (l CorpLocal) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 				return dns.RcodeNameError, nil
 			}
 			if isIPIntranet(ip6) {
-				returnOK(r, w, append([]dns.RR{}, makePTR(qname, strings.Join(ip6t, ".")+l.corpDomainV6, ttl)))
+				returnOK(r, w, append([]dns.RR{}, makePTR(qname, strings.Join(ip6t, "-")+l.corpDomainV6, ttl)))
 				return dns.RcodeSuccess, nil
 			}
 			break
@@ -201,7 +201,7 @@ func (l CorpLocal) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		}
 
 		if strings.HasSuffix(qname, l.corpDomain) {
-			ip := net.ParseIP(strings.TrimSuffix(qname, l.corpDomain))
+			ip := net.ParseIP(strings.ReplaceAll(strings.TrimSuffix(qname, l.corpDomain), "-", "."))
 			// Do parse and return A
 			if ip != nil {
 				returnOK(r, w, append([]dns.RR{}, makeA(qname, ip, ttl)))
@@ -220,7 +220,7 @@ func (l CorpLocal) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Ms
 		}
 
 		if strings.HasSuffix(qname, l.corpDomainV6) {
-			ip6 := net.ParseIP(strings.ReplaceAll(strings.TrimSuffix(qname, l.corpDomainV6), ".", ":"))
+			ip6 := net.ParseIP(strings.ReplaceAll(strings.TrimSuffix(qname, l.corpDomainV6), "-", ":"))
 			if ip6 != nil {
 				returnOK(r, w, append([]dns.RR{}, makeAAAA(qname, ip6, ttl)))
 				return dns.RcodeSuccess, nil
