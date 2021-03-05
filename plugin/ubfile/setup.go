@@ -3,6 +3,7 @@ package ubfile
 import (
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 
@@ -118,6 +119,14 @@ func setup(c *caddy.Controller) error {
 				if c.NextArg() {
 					return c.ArgErr()
 				}
+			case "cachedir":
+				if !c.NextArg() {
+					return c.ArgErr()
+				}
+				f.cacheDir = c.Val()
+				if _, err := os.Stat(f.cacheDir); os.IsNotExist(err) {
+					return fmt.Errorf("cachedir %s not exist", f.cacheDir)
+				}
 			default:
 				return c.ArgErr()
 			}
@@ -136,5 +145,14 @@ func setup(c *caddy.Controller) error {
 		return u
 	})
 
+	c.OnStartup(func() error {
+		u.uBData.onStartup()
+		return nil
+	})
+
+	c.OnShutdown(func() error {
+		u.uBData.onShutdown()
+		return nil
+	})
 	return nil
 }

@@ -3,10 +3,12 @@ package ubfile
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -43,7 +45,8 @@ type dnsZone struct {
 // IPAllocator allocates an IP from its name
 type IPAllocator interface {
 	AllocateIP(name string) []dns.RR
-	SetTTL(ttl uint32)
+	SaveToCache(filename string) error
+	LoadFromCache(filename string) error
 }
 
 // UBDataFile  hold everything the unbound file knows
@@ -53,6 +56,7 @@ type UBDataFile struct {
 	zoneRe, dataRe, soaRe, mxRe, aRe, aaaaRe, ptrRe, srvRe *regexp.Regexp
 	v4Allocator, v6Allocator                               IPAllocator
 	randomV4IP, randomV6IP                                 net.IP
+	cacheDir                                               string
 }
 
 // NewUBDataFile create a new object
@@ -148,6 +152,32 @@ func (u *UBDataFile) parseAndAddRecord(line string) error {
 		return nil
 	}
 	return fmt.Errorf("Invalid local data %s", line)
+}
+
+func (u *UBDataFile) onStartup() {
+	if u.cacheDir == "" {
+		return
+	}
+	if u.v4Allocator != nil {
+		u.v4Allocator.LoadFromCache(filepath.Join(u.cacheDir, "ipv4cache.json"))
+		u.v4Allocator.SaveToCache(filepath.Join(u.cacheDir, "ipv4cache.json"))
+	}
+	if u.v6Allocator != nil {
+		u.v6Allocator.LoadFromCache(filepath.Join(u.cacheDir, "ipv6cache.json"))
+		u.v6Allocator.SaveToCache(filepath.Join(u.cacheDir, "ipv6cache.json"))
+	}
+}
+
+func (u *UBDataFile) onShutdown() {
+	if u.cacheDir == "" {
+		return
+	}
+	if u.v4Allocator != nil {
+		u.v4Allocator.SaveToCache(filepath.Join(u.cacheDir, "ipv4cache.json"))
+	}
+	if u.v6Allocator != nil {
+		u.v6Allocator.SaveToCache(filepath.Join(u.cacheDir, "ipv6cache.json"))
+	}
 }
 
 // LoadFile create from file
@@ -382,26 +412,20 @@ func NewV4PrefixAddAllocator(n *net.IPNet, ttl uint32) (IPAllocator, error) {
 	}, nil
 }
 
+func ipV4ToUInt32(n net.IP) uint32 {
+	switch len(n) {
+	case net.IPv4len:
+		return binary.BigEndian.Uint32(n)
+	case net.IPv6len:
+		return binary.BigEndian.Uint32(n[12:])
+	}
+	return 0
+}
+
 // NewV4StartEndAddAllocator do
 func NewV4StartEndAddAllocator(startv, endv net.IP, ttl uint32) (IPAllocator, error) {
-	var start, end uint32
-	switch len(startv) {
-	case net.IPv4len:
-		start = binary.BigEndian.Uint32(startv)
-	case net.IPv6len:
-		start = binary.BigEndian.Uint32(startv[12:])
-	default:
-		return nil, fmt.Errorf("Internal error")
-	}
-
-	switch len(endv) {
-	case net.IPv4len:
-		end = binary.BigEndian.Uint32(endv)
-	case net.IPv6len:
-		end = binary.BigEndian.Uint32(endv[12:])
-	default:
-		return nil, fmt.Errorf("Internal error")
-	}
+	start := ipV4ToUInt32(startv)
+	end := ipV4ToUInt32(endv)
 	start = start - 1
 	if start > end {
 		return nil, fmt.Errorf("end %s must > start %s", startv.String(), endv.String())
@@ -437,9 +461,47 @@ func (v *IPv4AddAllocator) AllocateIP(name string) []dns.RR {
 	return rr
 }
 
-// SetTTL do
-func (v *IPv4AddAllocator) SetTTL(ttl uint32) {
-	v.ttl = ttl
+// LoadFromCache do
+func (v *IPv4AddAllocator) LoadFromCache(name string) error {
+	m, err := fileToMap(name)
+	if err != nil {
+		return err
+	}
+
+	var max uint32 = 0
+	for k, vv := range *m {
+		// parse v as IP
+		a := makeA(k, vv, uint64(v.ttl))
+		if a == nil {
+			continue
+		}
+		u := ipV4ToUInt32(a.A)
+		// check whether it is in range
+		if u < uint32(v.start) || u >= uint32(v.end) {
+			continue
+		}
+		if u > max {
+			max = u
+		}
+		_, ok := v.allocated.Load(k)
+		if !ok {
+			v.allocated.Store(k, append([]dns.RR{}, a))
+		}
+	}
+	if uint64(max) > v.allocatedBase {
+		v.allocatedBase = uint64(max)
+	}
+	return nil
+}
+
+// SaveToCache do
+func (v *IPv4AddAllocator) SaveToCache(name string) error {
+	m := make(map[string]string)
+	v.allocated.Range(func(k, r interface{}) bool {
+		m[k.(string)] = r.([]dns.RR)[0].(*dns.A).A.String()
+		return true
+	})
+	return mapToFile(name, &m)
 }
 
 // IPv6AddAllocator do
@@ -495,9 +557,50 @@ func (v *IPv6AddAllocator) AllocateIP(name string) []dns.RR {
 	return rr
 }
 
-// SetTTL do
-func (v *IPv6AddAllocator) SetTTL(ttl uint32) {
-	v.ttl = ttl
+// LoadFromCache do
+func (v *IPv6AddAllocator) LoadFromCache(name string) error {
+	m, err := fileToMap(name)
+	if err != nil {
+		return err
+	}
+
+	var max uint64 = 0
+	for k, vv := range *m {
+		// parse v as IP
+		aaaa := makeAAAA(k, vv, uint64(v.ttl))
+		if aaaa == nil {
+			continue
+		}
+		if v.prefix != binary.BigEndian.Uint64(aaaa.AAAA) {
+			continue
+		}
+		u := binary.BigEndian.Uint64(aaaa.AAAA[8:])
+		// check whether it is in range
+		if u < v.start || u >= v.end {
+			continue
+		}
+		if u > max {
+			max = u
+		}
+		_, ok := v.allocated.Load(k)
+		if !ok {
+			v.allocated.Store(k, append([]dns.RR{}, aaaa))
+		}
+	}
+	if max > v.allocatedBase {
+		v.allocatedBase = max
+	}
+	return nil
+}
+
+// SaveToCache do
+func (v *IPv6AddAllocator) SaveToCache(name string) error {
+	m := make(map[string]string)
+	v.allocated.Range(func(k, r interface{}) bool {
+		m[k.(string)] = r.([]dns.RR)[0].(*dns.AAAA).AAAA.String()
+		return true
+	})
+	return mapToFile(name, &m)
 }
 
 // IPv6HashAllocator do
@@ -532,9 +635,16 @@ func (v *IPv6HashAllocator) AllocateIP(name string) []dns.RR {
 	return rr
 }
 
-// SetTTL do
-func (v *IPv6HashAllocator) SetTTL(ttl uint32) {
-	v.ttl = ttl
+// LoadFromCache do
+func (v *IPv6HashAllocator) LoadFromCache(name string) error {
+	// Empty stub
+	return nil
+}
+
+// SaveToCache do
+func (v *IPv6HashAllocator) SaveToCache(name string) error {
+	// Empty stub
+	return nil
 }
 
 func makeA(name, ip string, ttl uint64) *dns.A {
@@ -632,4 +742,29 @@ func makeSOA(name, ns, mbox string, ttl, serial, refresh, retry, expire, minttl 
 	r.Expire = uint32(expire)
 	r.Minttl = uint32(minttl)
 	return r
+}
+
+func fileToMap(name string) (*map[string]string, error) {
+
+	data, err := os.ReadFile(name)
+	if err != nil {
+		log.Errorf("read cache file %s failed, error %v", name, err)
+		return nil, err
+	}
+	var ret map[string]string
+	err = json.Unmarshal(data, &ret)
+	if err != nil {
+		log.Errorf("parse cache file %s failed, error %v", name, err)
+		return nil, err
+	}
+	return &ret, nil
+}
+
+func mapToFile(name string, m *map[string]string) error {
+	data, _ := json.MarshalIndent(*m, "", "    ")
+	err := os.WriteFile(name, data, 0666)
+	if err != nil {
+		log.Errorf("write cache file %s failed, error %v", name, err)
+	}
+	return err
 }
