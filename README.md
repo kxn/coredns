@@ -3,6 +3,7 @@ This is a forked version of CoreDNS, which includes 3 changes
 * Enable multiple forward directives in the same block. The directives are evaluated from top to bottom at run time.
 * Slightly modified forward syntax which allows importing a snippet of "forward only" unbound config file
 * Added a ubfile plugin which can emulate almost the same behaviour of unbound local zone/data, taking unbound config snippet as input
+* Added a corplocal plugin which behaves like local plugin, but with configuable corp domain name.
 
 Basically it is used to replace the unbound software in a company's corporate network, so keeping unbound compatibility is first priority.
 
@@ -17,8 +18,8 @@ Example configuration
       prefetch 5
       serve_stale
    }
+   corplocal  corp.mycompany.com
    prometheus
-   loadbalance
    errors
 }
 ~~~
