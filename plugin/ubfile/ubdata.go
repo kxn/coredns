@@ -90,6 +90,11 @@ func (u *UBDataFile) parseAndAddRecord(line string) error {
 		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		r := makeA(name, m[0][3], ttl)
 		u.getRecord(name).addRR(r)
+		// HACK: add ipv6 randomlize ip for ipv4 record
+		if r.A.Equal(u.randomV4IP) {
+			r6 := makeAAAA(name, "::", ttl)
+			u.getRecord(name).addRR(r6)
+		}
 		return nil
 	}
 
@@ -98,7 +103,10 @@ func (u *UBDataFile) parseAndAddRecord(line string) error {
 		name := plugin.Host(m[0][1]).Normalize()
 		ttl, _ := strconv.ParseUint(m[0][2], 10, 32)
 		r := makeAAAA(name, m[0][3], ttl)
-		u.getRecord(name).addRR(r)
+		// HACK: only add ipv6 address when it is not a randomlized address
+		if !r.AAAA.Equal(u.randomV6IP) {
+			u.getRecord(name).addRR(r)
+		}
 		return nil
 	}
 
